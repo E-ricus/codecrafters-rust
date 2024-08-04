@@ -22,12 +22,12 @@ impl<'a> RawMessage<'a> {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct DNSMessage<'a> {
+pub struct DNSMessage {
     header: Header,
-    question: Question<'a>,
+    question: Question,
 }
 
-impl Default for DNSMessage<'_> {
+impl Default for DNSMessage {
     fn default() -> Self {
         let header = Header::default();
         let question = Question::default();
@@ -35,23 +35,22 @@ impl Default for DNSMessage<'_> {
     }
 }
 
-impl DNSMessage<'_> {
+impl DNSMessage {
     pub fn from_buf(buf: &[u8]) -> Result<Self> {
         // Will be used to map the whole message easier
         let _raw = RawMessage::new(buf);
         let mut header = Header::default();
-        // TODO: Parse question from message
-        let question = Question::default();
         let header_bytes = buf[0..12].try_into()?;
         header.read_bytes(header_bytes)?;
+        // TODO: sending all bytes
+        let question = Question::from_bytes(&buf[12..])?;
         Ok(Self { header, question })
     }
 
     pub fn build_reply(&self) -> Self {
         let mut reply = Self::default();
         reply.header = self.header.build_reply();
-        // TODO: Harcoding for now, when question is parsed it should be removed.
-        reply.question.name = "codefracters.io";
+        reply.question = self.question.clone();
         reply
     }
 

@@ -1,7 +1,8 @@
 use anyhow::Result;
+use std::str;
 
-#[derive(Debug, PartialEq)]
-#[repr(u8)]
+#[derive(Debug, PartialEq, Clone, Copy)]
+#[repr(u16)]
 enum QType {
     A = 1,      // host address
     NS = 2,     // NS: authorative name server
@@ -21,10 +22,10 @@ enum QType {
     TXT = 16,   // TXT: text strings
 }
 
-impl TryFrom<u8> for QType {
+impl TryFrom<u16> for QType {
     type Error = anyhow::Error;
 
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
             1 => Ok(Self::A),
             2 => Ok(Self::NS),
@@ -47,8 +48,8 @@ impl TryFrom<u8> for QType {
     }
 }
 
-#[derive(Debug, PartialEq)]
-#[repr(u8)]
+#[derive(Debug, PartialEq, Clone, Copy)]
+#[repr(u16)]
 enum Class {
     IN = 1, // IN: Internet
     CS = 2, // CSNET (obsolete)
@@ -56,10 +57,10 @@ enum Class {
     HS = 4, // HS: Hesiod
 }
 
-impl TryFrom<u8> for Class {
+impl TryFrom<u16> for Class {
     type Error = anyhow::Error;
 
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
             1 => Ok(Self::IN),
             2 => Ok(Self::CS),
@@ -70,30 +71,45 @@ impl TryFrom<u8> for Class {
     }
 }
 
-#[derive(Debug, PartialEq)]
-pub(super) struct Question<'a> {
+#[derive(Debug, PartialEq, Clone)]
+pub(super) struct Question {
     // TODO: Remove pub
-    pub(super) name: &'a str, // domain name
-    qtype: QType,             // 2 bytes
-    class: Class,             // 2 bytes
+    pub(super) name: String, // domain name
+    qtype: QType,            // 2 bytes
+    class: Class,            // 2 bytes
 }
 
-impl Default for Question<'_> {
+impl Default for Question {
     fn default() -> Self {
         Question {
-            name: "",
+            name: "".to_string(),
             qtype: QType::A,
             class: Class::IN,
         }
     }
 }
 
-impl Question<'_> {
-    pub(super) fn from_bytes(_bytes: Vec<u8>) -> Result<Self> {
-        // let mut current: u8 = 0;
-        // for byte in bytes {}
-        unimplemented!("not implemented");
+impl Question {
+    pub(super) fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut current = 1;
+        let mut labels = vec![];
+        let mut len = bytes[0] as usize;
+
+        while len != 0 {
+            let label = &bytes[current..current + len];
+            labels.push(str::from_utf8(label)?);
+            current += len + 1;
+            len = bytes[current - 1] as usize;
+        }
+        let name = labels.join(".");
+        let qtype: QType =
+            u16::from_be_bytes(bytes[current..current + 2].try_into()?).try_into()?;
+        let class: Class =
+            u16::from_be_bytes(bytes[current + 2..current + 4].try_into()?).try_into()?;
+
+        Ok(Self { name, qtype, class })
     }
+
     pub(super) fn to_bytes(self) -> Vec<u8> {
         let mut bytes = self.name.split('.').fold(Vec::new(), |mut bytes, label| {
             let len = label.len() as u8;
@@ -101,8 +117,13 @@ impl Question<'_> {
             bytes.extend_from_slice(label.as_bytes());
             bytes
         });
-        bytes.push(self.qtype as u8);
-        bytes.push(self.class as u8);
+        // Add null termination
+        bytes.push(0);
+
+        let qtype = self.qtype as u16;
+        bytes.extend_from_slice(&qtype.to_be_bytes());
+        let class = self.class as u16;
+        bytes.extend_from_slice(&class.to_be_bytes());
         bytes
     }
 }
@@ -112,9 +133,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_question_to_bytes() {
+    fn test_question_from_bytes() -> Result<()> {
+        let mut bytes: Vec<u8> = vec![12];
+        bytes.extend_from_slice("codecrafters".as_bytes());
+        bytes.push(2);
+        bytes.extend_from_slice("io".as_bytes());
+        bytes.push(0);
+        let cname: u16 = 5;
+        bytes.extend_from_slice(&cname.to_be_bytes());
+        let ch: u16 = 3;
+        bytes.extend_from_slice(&ch.to_be_bytes());
+
+        let q = Question::from_bytes(&bytes)?;
+        assert_eq!("codecrafters.io".to_string(), q.name);
+        assert_eq!(QType::CName, q.qtype);
+        assert_eq!(Class::CH, q.class);
+        Ok(())
+    }
+
+    #[test]
+    fn test_question_to_bytes() -> Result<()> {
         let mut question = Question::default();
-        question.name = "codecrafters.io";
+        question.name = "codecrafters.io".to_string();
 
         let bytes = question.to_bytes();
         let len = bytes[0];
@@ -134,7 +174,12 @@ mod tests {
         let label = String::from_utf8_lossy(&bytes[curr_index..next_index]);
         assert_eq!("io", label);
 
-        assert_eq!(1, bytes[next_index]);
-        assert_eq!(1, bytes[next_index + 1]);
+        // null termination
+        assert_eq!(0, bytes[next_index]);
+        let array: [u8; 2] = [bytes[next_index + 1], bytes[next_index + 2]];
+        assert_eq!(1, u16::from_be_bytes(array));
+        let array: [u8; 2] = [bytes[next_index + 3], bytes[next_index + 4]];
+        assert_eq!(1, u16::from_be_bytes(array));
+        Ok(())
     }
 }
