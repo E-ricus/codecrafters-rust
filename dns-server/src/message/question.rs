@@ -1,89 +1,20 @@
 use anyhow::Result;
 use std::str;
 
-#[derive(Debug, PartialEq, Clone, Copy)]
-#[repr(u16)]
-enum QType {
-    A = 1,      // host address
-    NS = 2,     // NS: authorative name server
-    MD = 3,     // MD: mail destination (obsolete)
-    MF = 4,     // MF: mail forwarder (obsolete)
-    CName = 5,  // CNAME: canonical name for alias
-    SOA = 6,    // SOA: zone of a authority
-    MB = 7,     // MB: Mail box domain
-    MG = 8,     // // MG: Mail group member
-    MR = 9,     // MR: Mail rename
-    Null = 10,  // NULL
-    WKS = 11,   // WKS: well known service description
-    PTR = 12,   // PTR: a domain name pointer
-    HInfo = 13, // HINFO: host information
-    MInfo = 14, // MINFO:  mailbox or mail list information
-    MX = 15,    // MX: mail exchange
-    TXT = 16,   // TXT: text strings
-}
-
-impl TryFrom<u16> for QType {
-    type Error = anyhow::Error;
-
-    fn try_from(value: u16) -> Result<Self, Self::Error> {
-        match value {
-            1 => Ok(Self::A),
-            2 => Ok(Self::NS),
-            3 => Ok(Self::MD),
-            4 => Ok(Self::MF),
-            5 => Ok(Self::CName),
-            6 => Ok(Self::SOA),
-            7 => Ok(Self::MB),
-            8 => Ok(Self::MG),
-            9 => Ok(Self::MR),
-            10 => Ok(Self::Null),
-            11 => Ok(Self::WKS),
-            12 => Ok(Self::PTR),
-            13 => Ok(Self::HInfo),
-            14 => Ok(Self::MInfo),
-            15 => Ok(Self::MX),
-            16 => Ok(Self::TXT),
-            _ => Err(anyhow::anyhow!("invalid value")),
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Clone, Copy)]
-#[repr(u16)]
-enum Class {
-    IN = 1, // IN: Internet
-    CS = 2, // CSNET (obsolete)
-    CH = 3, // CH: Chaos class
-    HS = 4, // HS: Hesiod
-}
-
-impl TryFrom<u16> for Class {
-    type Error = anyhow::Error;
-
-    fn try_from(value: u16) -> Result<Self, Self::Error> {
-        match value {
-            1 => Ok(Self::IN),
-            2 => Ok(Self::CS),
-            3 => Ok(Self::CH),
-            4 => Ok(Self::HS),
-            _ => Err(anyhow::anyhow!("invalid value")),
-        }
-    }
-}
+use super::{Class, Type};
 
 #[derive(Debug, PartialEq, Clone)]
 pub(super) struct Question {
-    // TODO: Remove pub
     pub(super) name: String, // domain name
-    qtype: QType,            // 2 bytes
-    class: Class,            // 2 bytes
+    pub(super) qtype: Type,  // 2 bytes
+    pub(super) class: Class, // 2 bytes
 }
 
 impl Default for Question {
     fn default() -> Self {
         Question {
             name: "".to_string(),
-            qtype: QType::A,
+            qtype: Type::A,
             class: Class::IN,
         }
     }
@@ -102,8 +33,7 @@ impl Question {
             len = bytes[current - 1] as usize;
         }
         let name = labels.join(".");
-        let qtype: QType =
-            u16::from_be_bytes(bytes[current..current + 2].try_into()?).try_into()?;
+        let qtype: Type = u16::from_be_bytes(bytes[current..current + 2].try_into()?).try_into()?;
         let class: Class =
             u16::from_be_bytes(bytes[current + 2..current + 4].try_into()?).try_into()?;
 
@@ -146,7 +76,7 @@ mod tests {
 
         let q = Question::from_bytes(&bytes)?;
         assert_eq!("codecrafters.io".to_string(), q.name);
-        assert_eq!(QType::CName, q.qtype);
+        assert_eq!(Type::CName, q.qtype);
         assert_eq!(Class::CH, q.class);
         Ok(())
     }
