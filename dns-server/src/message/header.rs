@@ -73,7 +73,6 @@ impl TryFrom<u8> for ResponseCode {
 
 #[derive(Debug, PartialEq, Copy, Clone)]
 pub struct Header {
-    // TODO: pub for now, maybe move creating the reply header here.
     id: u16,                     // ID: 16 bits big endian
     message_type: MessageType,   // QR: 1 bit
     op_code: OpCode,             // OPCODE: 4 bits
@@ -113,7 +112,8 @@ impl Header {
     pub(super) fn build_reply(&self) -> Self {
         let mut reply = self.clone();
         reply.message_type = MessageType::Response;
-        reply.an_count = 1;
+        // Ideally answering the same amount of questions
+        reply.an_count = self.qd_count;
         reply.response_code = match self.op_code {
             OpCode::Query => ResponseCode::NoError,
             _ => ResponseCode::NotImplemented,
@@ -121,28 +121,30 @@ impl Header {
         reply
     }
 
-    pub(super) fn read_bytes(&mut self, buf: [u8; 12]) -> Result<()> {
+    // Safety: Using directly the indices of the array as we expect a known size
+    pub(super) fn from_bytes(buf: [u8; 12]) -> Result<Self> {
+        let mut header = Self::default();
         let id: [u8; 2] = buf[0..2].try_into()?;
-        self.id = u16::from_be_bytes(id);
+        header.id = u16::from_be_bytes(id);
 
         let bit_qr = (buf[2] & 0b10000000) >> 7;
-        self.message_type = bit_qr.try_into()?;
+        header.message_type = bit_qr.try_into()?;
         let bits_op = (buf[2] & 0b01111000) >> 3;
-        self.op_code = bits_op.try_into()?;
-        self.auth_answer = (buf[2] & 0b00000100) >> 2 != 0;
-        self.truncation = (buf[2] & 0b00000010) >> 1 != 0;
-        self.recursion_desired = (buf[2] & 0b00000001) != 0;
+        header.op_code = bits_op.try_into()?;
+        header.auth_answer = (buf[2] & 0b00000100) >> 2 != 0;
+        header.truncation = (buf[2] & 0b00000010) >> 1 != 0;
+        header.recursion_desired = (buf[2] & 0b00000001) != 0;
 
-        self.recursion_available = (buf[3] & 0b10000000) >> 7 != 0;
-        self.z = (buf[3] & 0b01110000) >> 4;
+        header.recursion_available = (buf[3] & 0b10000000) >> 7 != 0;
+        header.z = (buf[3] & 0b01110000) >> 4;
         let bits_rc = buf[3] & 0b00001111;
-        self.response_code = bits_rc.try_into()?;
+        header.response_code = bits_rc.try_into()?;
 
-        self.qd_count = u16::from_be_bytes(buf[4..6].try_into()?);
-        self.an_count = u16::from_be_bytes(buf[6..8].try_into()?);
-        self.ns_count = u16::from_be_bytes(buf[8..10].try_into()?);
-        self.ar_count = u16::from_be_bytes(buf[10..12].try_into()?);
-        Ok(())
+        header.qd_count = u16::from_be_bytes(buf[4..6].try_into()?);
+        header.an_count = u16::from_be_bytes(buf[6..8].try_into()?);
+        header.ns_count = u16::from_be_bytes(buf[8..10].try_into()?);
+        header.ar_count = u16::from_be_bytes(buf[10..12].try_into()?);
+        Ok(header)
     }
 
     pub(super) fn to_bytes(self) -> [u8; 12] {
@@ -212,8 +214,7 @@ mod tests {
         buf[7] = 0b0000_1000;
         buf[11] = 0b0000_1100;
 
-        let mut h = Header::default();
-        h.read_bytes(buf)?;
+        let h = Header::from_bytes(buf)?;
 
         assert_eq!(1234, h.id);
         assert_eq!(MessageType::Response, h.message_type);
@@ -238,8 +239,7 @@ fn test_header_from_bytes_codecrafters_op_code() -> Result<()> {
     buf[7] = 0b0000_1000;
     buf[11] = 0b0000_1100;
 
-    let mut h = Header::default();
-    h.read_bytes(buf)?;
+    let h = Header::from_bytes(buf)?;
 
     assert_eq!(1234, h.id);
     assert_eq!(MessageType::Response, h.message_type);

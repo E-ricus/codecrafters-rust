@@ -39,7 +39,7 @@ fn domains() -> &'static HashMap<&'static str, &'static str> {
 }
 
 impl ResourceRecord {
-    pub(super) fn answer_by_type(qtype: Type, name: &str) -> Option<Self> {
+    pub(super) fn answer_by_type(qtype: Type, name: &str) -> Self {
         match qtype {
             Type::A => {
                 let ip = match domains().get(name) {
@@ -47,15 +47,14 @@ impl ResourceRecord {
                     None => Ipv4Addr::new(8, 8, 8, 8),
                 };
                 // I think that if a dns server doesn't have a domain it should not return it.
-                let rr = Self {
+                Self {
                     name: name.to_string(),
                     atype: qtype,
                     class: Class::IN,
                     ttl: 60,
                     length: 4,
                     data: Data::IP(ip),
-                };
-                return Some(rr);
+                }
             }
             _ => unimplemented!("not implemented"),
         }
@@ -103,8 +102,6 @@ mod tests {
             data: Data::IP(Ipv4Addr::from_bits(0x08080808)),
         };
         let answer = ResourceRecord::answer_by_type(Type::A, "codecrafters.io");
-        assert!(answer.is_some());
-        let answer = answer.unwrap();
         assert_eq!(expected_answer, answer);
     }
 

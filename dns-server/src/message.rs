@@ -2,16 +2,51 @@ mod answer;
 mod header;
 mod question;
 
+use std::ops::Range;
+
 use answer::ResourceRecord;
 use header::Header;
 use question::Question;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 
-#[allow(dead_code)]
+// Small wrapper to keep track of the current position while parsing.
 struct RawMessage<'a> {
     buffer: &'a [u8],
     current_pos: usize,
+}
+
+impl<'a> RawMessage<'a> {
+    fn new(buffer: &'a [u8]) -> Self {
+        Self {
+            buffer,
+            current_pos: 0,
+        }
+    }
+    fn get(&self, n: usize) -> Result<u8> {
+        self.buffer
+            .get(n)
+            .map(|v| *v)
+            .ok_or(anyhow!("invalid index: {n}"))
+    }
+
+    // get the range without updating the current pointer
+    fn get_range(&self, range: Range<usize>) -> Result<&[u8]> {
+        self.buffer.get(range).ok_or(anyhow!("invalid range"))
+    }
+
+    // updates the current pointer
+    fn current_and_advance_range(&mut self, n: usize) -> Result<&[u8]> {
+        if self.current_pos + n > self.buffer.len() {
+            return Err(anyhow!("the {n} exceeds the size of the buffer"));
+        }
+        let next = self
+            .buffer
+            .get(self.current_pos..self.current_pos + n)
+            .ok_or(anyhow!("invalid range"));
+        self.current_pos += n;
+        next
+    }
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -84,49 +119,77 @@ impl TryFrom<u16> for Type {
     }
 }
 
-impl<'a> RawMessage<'a> {
-    fn new(buffer: &'a [u8]) -> Self {
-        Self {
-            buffer,
-            current_pos: 0,
-        }
-    }
-}
-
 #[derive(Debug, PartialEq)]
 pub struct DNSMessage {
     header: Header,
-    question: Question,
+    question: Option<Vec<Question>>,
     answer: Option<Vec<ResourceRecord>>,
 }
 
 impl Default for DNSMessage {
     fn default() -> Self {
         let header = Header::default();
-        let question = Question::default();
         Self {
             header,
-            question,
+            question: None,
             answer: None,
         }
     }
 }
 
 impl DNSMessage {
-    pub fn from_buf(buf: &[u8]) -> Result<Self> {
-        // Will be used to map the whole message easier
-        let _raw = RawMessage::new(buf);
-        let mut header = Header::default();
+    pub fn from_bytes(buf: &[u8]) -> Result<Self> {
+        if buf.len() < 12 {
+            return Err(anyhow!(
+                "invalid message: expecting at least 12 octets for the header."
+            ));
+        }
+        println!("{:?}", buf);
         let header_bytes = buf[0..12].try_into()?;
-        header.read_bytes(header_bytes)?;
-        // TODO: sending all bytes to the question
-        let question = Question::from_bytes(&buf[12..])?;
-        // TODO: do we need to parse an answer?
+        let header = Header::from_bytes(header_bytes)?;
+
+        let mut raw = RawMessage::new(&buf);
+        // The 12 bytes of the header are already parsed
+        raw.current_pos = 12;
+        let mut questions = Vec::with_capacity(header.qd_count as usize);
+        for _ in 0..header.qd_count {
+            questions.push(Question::from_bytes(&mut raw)?)
+        }
         Ok(Self {
             header,
-            question,
+            question: Some(questions),
             answer: None,
         })
+    }
+
+    pub fn to_bytes(self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&self.header.to_bytes());
+        if let Some(questions) = self.question {
+            for q in questions {
+                bytes.extend(q.to_bytes());
+            }
+        }
+        if let Some(answer) = self.answer {
+            for rr in answer {
+                bytes.extend(rr.to_bytes());
+            }
+        }
+        bytes
+    }
+
+    pub fn build_reply(self) -> Self {
+        let mut reply = Self::default();
+        reply.header = self.header.build_reply();
+
+        if let Some(questions) = &self.question {
+            for q in questions {
+                let rr = ResourceRecord::answer_by_type(q.qtype, &q.name);
+                reply.add_answer(rr)
+            }
+        }
+        reply.question = self.question;
+        reply
     }
 
     fn add_answer(&mut self, rr: ResourceRecord) {
@@ -135,28 +198,98 @@ impl DNSMessage {
             None => self.answer = Some(vec![rr]),
         }
     }
+}
 
-    pub fn build_reply(&self) -> Self {
-        let mut reply = Self::default();
-        reply.header = self.header.build_reply();
-        reply.question = self.question.clone();
+// returns the index to start reading the label from if it is a pointer
+// otherwise, returns None
+fn pointer(byte: u8, next: u8) -> Option<u16> {
+    if byte != 0b11000000 {
+        return None;
+    }
+    let pointer = ((byte as u16) << 8) | (next as u16);
+    // XORing with this mask to remove the 11 in the more significant bits indicating the pointer and get the correct offset
+    Some(pointer ^ 0xC000)
+}
 
-        if let Some(rr) = ResourceRecord::answer_by_type(reply.question.qtype, &reply.question.name)
-        {
-            reply.add_answer(rr)
-        }
-        reply
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pointer() {
+        let b1 = 0b11000000;
+        let b2 = 0b00001100;
+
+        let p = pointer(b1, b2);
+        assert!(p.is_some());
+        assert_eq!(12, p.unwrap());
+
+        let b1 = 0b00000000;
+        let b2 = 0b00001100;
+
+        let p = pointer(b1, b2);
+        assert!(p.is_none());
     }
 
-    pub fn to_bytes(self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&self.header.to_bytes());
-        bytes.extend(self.question.to_bytes());
-        if let Some(answer) = self.answer {
-            for rr in answer {
-                bytes.extend(rr.to_bytes());
-            }
-        }
-        bytes
+    #[test]
+    fn test_from_bytes_uncompressed() -> Result<()> {
+        let request: [u8; 512] = [
+            118, 24, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 12, 99, 111, 100, 101, 99, 114, 97, 102, 116,
+            101, 114, 115, 2, 105, 111, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let message = DNSMessage::from_bytes(&request)?;
+        assert!(message.question.is_some());
+        let question = message.question.unwrap();
+        assert_eq!(1, question.len());
+        assert_eq!("codecrafters.io", question[0].name);
+        Ok(())
+    }
+
+    #[test]
+    fn test_from_bytes_compressed() -> Result<()> {
+        let request: [u8; 512] = [
+            219, 56, 1, 0, 0, 2, 0, 0, 0, 0, 0, 0, 3, 97, 98, 99, 17, 108, 111, 110, 103, 97, 115,
+            115, 100, 111, 109, 97, 105, 110, 110, 97, 109, 101, 3, 99, 111, 109, 0, 0, 1, 0, 1, 3,
+            100, 101, 102, 192, 16, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0,
+        ];
+        let message = DNSMessage::from_bytes(&request)?;
+        assert!(message.question.is_some());
+        let question = message.question.unwrap();
+        assert_eq!(2, question.len());
+        assert_eq!("abc.longassdomainname.com", question[0].name);
+        assert_eq!("def.longassdomainname.com", question[1].name);
+        Ok(())
     }
 }

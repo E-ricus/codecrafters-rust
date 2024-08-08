@@ -15,7 +15,7 @@ fn main() -> Result<()> {
         match udp_socket.recv_from(&mut buf) {
             Ok((size, source)) => {
                 println!("Received {} bytes from {}", size, source);
-                let message = DNSMessage::from_buf(&buf)?;
+                let message = DNSMessage::from_bytes(&buf)?;
                 let response = message.build_reply().to_bytes();
 
                 udp_socket.send_to(&response, source)?;
