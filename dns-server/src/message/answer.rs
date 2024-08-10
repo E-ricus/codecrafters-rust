@@ -1,23 +1,26 @@
+use core::str;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 use std::sync::OnceLock;
 
-use super::{Class, Type};
+use anyhow::Result;
+
+use super::{parse_labels, Class, RawMessage, Type};
 
 #[derive(Debug, PartialEq, Clone, Copy)]
-enum Data {
+pub(super) enum Data {
     None,
     IP(Ipv4Addr),
 }
 #[derive(Debug, PartialEq, Clone)]
-pub(super) struct ResourceRecord {
-    name: String,
-    atype: Type,
-    class: Class,
-    ttl: u32, // The specification asks for a signed int, using a signed one for now.
-    length: u16,
-    data: Data, // RDATA
+pub(crate) struct ResourceRecord {
+    pub(super) name: String,
+    pub(super) atype: Type,
+    pub(super) class: Class,
+    pub(super) ttl: u32, // The specification asks for a signed int, using a signed one for now.
+    pub(super) length: u16,
+    pub(super) data: Data, // RDATA
 }
 
 impl Default for ResourceRecord {
@@ -35,7 +38,15 @@ impl Default for ResourceRecord {
 
 fn domains() -> &'static HashMap<&'static str, &'static str> {
     static DOMAINS: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
-    DOMAINS.get_or_init(|| [("codecrafters.io", "8.8.8.8")].iter().copied().collect())
+    DOMAINS.get_or_init(|| {
+        [
+            ("codecrafters.io", "8.8.8.8"),
+            ("another.codecrafters.io", "1.1.1.1"),
+        ]
+        .iter()
+        .copied()
+        .collect()
+    })
 }
 
 impl ResourceRecord {
@@ -60,7 +71,34 @@ impl ResourceRecord {
         }
     }
 
-    pub(super) fn to_bytes(self) -> Vec<u8> {
+    pub(super) fn from_bytes(bytes: &mut RawMessage) -> Result<Self> {
+        let name = parse_labels(bytes)?;
+        let atype =
+            u16::from_be_bytes(bytes.current_and_advance_range(2)?.try_into()?).try_into()?;
+        let class =
+            u16::from_be_bytes(bytes.current_and_advance_range(2)?.try_into()?).try_into()?;
+        let ttl = u32::from_be_bytes(bytes.current_and_advance_range(4)?.try_into()?);
+        let length = u16::from_be_bytes(bytes.current_and_advance_range(2)?.try_into()?);
+        let data = bytes.current_and_advance_range(length as usize)?;
+        let data = match atype {
+            // Only mapping length 4
+            // But in theory, it should be fine for a type A
+            Type::A => Data::IP(Ipv4Addr::new(data[0], data[1], data[2], data[3])),
+            // Unimplemented
+            _ => Data::None,
+        };
+
+        Ok(Self {
+            name,
+            atype,
+            class,
+            ttl,
+            length,
+            data,
+        })
+    }
+
+    pub(super) fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = self.name.split('.').fold(Vec::new(), |mut bytes, label| {
             let len = label.len() as u8;
             bytes.push(len);
@@ -151,6 +189,85 @@ mod tests {
         let array: [u8; 2] = [bytes[next_index + 9], bytes[next_index + 10]];
         assert_eq!(4, u16::from_be_bytes(array));
         assert_eq!(&[8, 8, 8, 8], &bytes[next_index + 11..]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_from_bytes_uncompressed() -> Result<()> {
+        let mut bytes: Vec<u8> = vec![12];
+        bytes.extend_from_slice("codecrafters".as_bytes());
+        bytes.push(2);
+        bytes.extend_from_slice("io".as_bytes());
+        // Null terminated label
+        bytes.push(0);
+        let typ: u16 = 1;
+        bytes.extend_from_slice(&typ.to_be_bytes());
+        let class: u16 = 1;
+        bytes.extend_from_slice(&class.to_be_bytes());
+        let ttl: u32 = 60;
+        bytes.extend_from_slice(&ttl.to_be_bytes());
+        let length: u16 = 4;
+        bytes.extend_from_slice(&length.to_be_bytes());
+        let data = [8, 8, 8, 8];
+        bytes.extend_from_slice(&data);
+
+        let mut raw = RawMessage::new(&bytes);
+        let rr = ResourceRecord::from_bytes(&mut raw)?;
+        assert_eq!("codecrafters.io".to_string(), rr.name);
+        assert_eq!(Type::A, rr.atype);
+        assert_eq!(Class::IN, rr.class);
+        assert_eq!(ttl, rr.ttl);
+        match rr.data {
+            Data::None => panic!("data was not mapped"),
+            Data::IP(ip) => assert_eq!(data, ip.octets()),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_from_bytes_with_compression() -> Result<()> {
+        let mut bytes: Vec<u8> = vec![12];
+        // Another question in the message
+        bytes.extend_from_slice("codecrafters".as_bytes());
+        bytes.push(2);
+        bytes.extend_from_slice("io".as_bytes());
+        // Null terminated label
+        bytes.push(0);
+        let typ: u16 = 1;
+        bytes.extend_from_slice(&typ.to_be_bytes());
+        let ch: u16 = 1;
+        bytes.extend_from_slice(&ch.to_be_bytes());
+
+        // the question being parsed
+        bytes.push(7);
+        bytes.extend_from_slice("another".as_bytes());
+        // Pointer byte
+        bytes.push(0b11000000);
+        // Offsite to the beginning of the slice
+        bytes.push(0);
+        let typ: u16 = 1;
+        bytes.extend_from_slice(&typ.to_be_bytes());
+        let class: u16 = 1;
+        bytes.extend_from_slice(&class.to_be_bytes());
+        let ttl: u32 = 60;
+        bytes.extend_from_slice(&ttl.to_be_bytes());
+        let length: u16 = 4;
+        bytes.extend_from_slice(&length.to_be_bytes());
+        let data = [1, 1, 1, 1];
+        bytes.extend_from_slice(&data);
+
+        let mut raw = RawMessage::new(&bytes);
+        // Start of the question being parsed
+        raw.current_pos = 21;
+        let rr = ResourceRecord::from_bytes(&mut raw)?;
+        assert_eq!("another.codecrafters.io".to_string(), rr.name);
+        assert_eq!(Type::A, rr.atype);
+        assert_eq!(Class::IN, rr.class);
+        assert_eq!(ttl, rr.ttl);
+        match rr.data {
+            Data::None => panic!("data was not mapped"),
+            Data::IP(ip) => assert_eq!(data, ip.octets()),
+        }
         Ok(())
     }
 }

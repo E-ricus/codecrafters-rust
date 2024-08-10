@@ -10,6 +10,26 @@ use question::Question;
 
 use anyhow::{anyhow, Result};
 
+// Small macro to impl try from in enums repr
+// Is it worth it to make it a proc macro to just derive it in each enum?
+#[macro_export]
+macro_rules! impl_try_from {
+    ($enum_name:ident, $repr:ty, { $($variant:ident = $value:expr,)* }) => {
+        impl TryFrom<$repr> for $enum_name {
+            type Error = anyhow::Error;
+
+            fn try_from(value: $repr) -> Result<Self, Self::Error> {
+                match value {
+                    $(
+                        $value => Ok(Self::$variant),
+                    )*
+                    _ => Err(anyhow::anyhow!("{} invalid value: {}", stringify!($enum_name) , value)),
+                }
+            }
+        }
+    };
+}
+
 // Small wrapper to keep track of the current position while parsing.
 struct RawMessage<'a> {
     buffer: &'a [u8],
@@ -26,7 +46,7 @@ impl<'a> RawMessage<'a> {
     fn get(&self, n: usize) -> Result<u8> {
         self.buffer
             .get(n)
-            .map(|v| *v)
+            .copied()
             .ok_or(anyhow!("invalid index: {n}"))
     }
 
@@ -58,19 +78,12 @@ enum Class {
     HS = 4, // HS: Hesiod
 }
 
-impl TryFrom<u16> for Class {
-    type Error = anyhow::Error;
-
-    fn try_from(value: u16) -> Result<Self, Self::Error> {
-        match value {
-            1 => Ok(Self::IN),
-            2 => Ok(Self::CS),
-            3 => Ok(Self::CH),
-            4 => Ok(Self::HS),
-            _ => Err(anyhow::anyhow!("Class: invalid value: {value}")),
-        }
-    }
-}
+impl_try_from!(Class, u16, {
+    IN = 1,
+    CS = 2,
+    CH = 3,
+    HS = 4,
+});
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 #[repr(u16)]
@@ -80,50 +93,43 @@ enum Type {
     MD = 3,     // MD: mail destination (obsolete)
     MF = 4,     // MF: mail forwarder (obsolete)
     CName = 5,  // CNAME: canonical name for alias
-    SOA = 6,    // SOA: zone of a authority
+    Soa = 6,    // SOA: zone of a authority
     MB = 7,     // MB: Mail box domain
     MG = 8,     // // MG: Mail group member
     MR = 9,     // MR: Mail rename
     Null = 10,  // NULL
-    WKS = 11,   // WKS: well known service description
-    PTR = 12,   // PTR: a domain name pointer
+    Wks = 11,   // WKS: well known service description
+    Ptr = 12,   // PTR: a domain name pointer
     HInfo = 13, // HINFO: host information
     MInfo = 14, // MINFO:  mailbox or mail list information
     MX = 15,    // MX: mail exchange
-    TXT = 16,   // TXT: text strings
+    Txt = 16,   // TXT: text strings
 }
 
-impl TryFrom<u16> for Type {
-    type Error = anyhow::Error;
+impl_try_from!(Type, u16, {
+    A = 1,
+    NS = 2,
+    MD = 3,
+    MF = 4,
+    CName = 5,
+    Soa = 6,
+    MB = 7,
+    MG = 8,
+    MR = 9,
+    Null = 10,
+    Wks = 11,
+    Ptr = 12,
+    HInfo = 13,
+    MInfo = 14,
+    MX = 15,
+    Txt = 16,
+});
 
-    fn try_from(value: u16) -> Result<Self, Self::Error> {
-        match value {
-            1 => Ok(Self::A),
-            2 => Ok(Self::NS),
-            3 => Ok(Self::MD),
-            4 => Ok(Self::MF),
-            5 => Ok(Self::CName),
-            6 => Ok(Self::SOA),
-            7 => Ok(Self::MB),
-            8 => Ok(Self::MG),
-            9 => Ok(Self::MR),
-            10 => Ok(Self::Null),
-            11 => Ok(Self::WKS),
-            12 => Ok(Self::PTR),
-            13 => Ok(Self::HInfo),
-            14 => Ok(Self::MInfo),
-            15 => Ok(Self::MX),
-            16 => Ok(Self::TXT),
-            _ => Err(anyhow::anyhow!("Type: invalid value: {value}")),
-        }
-    }
-}
-
-#[derive(Debug, PartialEq)]
-pub struct DNSMessage {
-    header: Header,
-    question: Option<Vec<Question>>,
-    answer: Option<Vec<ResourceRecord>>,
+#[derive(Debug, PartialEq, Clone)]
+pub(crate) struct DNSMessage {
+    pub(crate) header: Header,
+    pub(crate) question: Option<Vec<Question>>,
+    pub(crate) answer: Option<Vec<ResourceRecord>>,
 }
 
 impl Default for DNSMessage {
@@ -138,39 +144,63 @@ impl Default for DNSMessage {
 }
 
 impl DNSMessage {
+    pub fn answers(&self) -> usize {
+        self.header.an_count as usize
+    }
+    pub fn questions(&self) -> usize {
+        self.header.qd_count as usize
+    }
     pub fn from_bytes(buf: &[u8]) -> Result<Self> {
         if buf.len() < 12 {
             return Err(anyhow!(
                 "invalid message: expecting at least 12 octets for the header."
             ));
         }
-        println!("{:?}", buf);
         let header_bytes = buf[0..12].try_into()?;
         let header = Header::from_bytes(header_bytes)?;
+        println!("message id: {:?}", header.id);
 
-        let mut raw = RawMessage::new(&buf);
+        let mut raw = RawMessage::new(buf);
         // The 12 bytes of the header are already parsed
         raw.current_pos = 12;
-        let mut questions = Vec::with_capacity(header.qd_count as usize);
-        for _ in 0..header.qd_count {
-            questions.push(Question::from_bytes(&mut raw)?)
-        }
+
+        let question = if header.qd_count != 0 {
+            let mut questions = Vec::with_capacity(header.qd_count as usize);
+            for i in 0..header.qd_count {
+                println!("parsing question: {}", i + 1);
+                questions.push(Question::from_bytes(&mut raw)?)
+            }
+            Some(questions)
+        } else {
+            None
+        };
+        let answer = if header.an_count != 0 {
+            let mut answers = Vec::with_capacity(header.an_count as usize);
+            for i in 0..header.an_count {
+                println!("parsing answer: {}", i + 1);
+                answers.push(ResourceRecord::from_bytes(&mut raw)?)
+            }
+            Some(answers)
+        } else {
+            None
+        };
+
         Ok(Self {
             header,
-            question: Some(questions),
-            answer: None,
+            question,
+            answer,
         })
     }
 
-    pub fn to_bytes(self) -> Vec<u8> {
+    pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&self.header.to_bytes());
-        if let Some(questions) = self.question {
+        if let Some(questions) = &self.question {
             for q in questions {
                 bytes.extend(q.to_bytes());
             }
         }
-        if let Some(answer) = self.answer {
+        if let Some(answer) = &self.answer {
             for rr in answer {
                 bytes.extend(rr.to_bytes());
             }
@@ -179,8 +209,10 @@ impl DNSMessage {
     }
 
     pub fn build_reply(self) -> Self {
-        let mut reply = Self::default();
-        reply.header = self.header.build_reply();
+        let mut reply = Self {
+            header: self.header.build_reply(),
+            ..Default::default()
+        };
 
         if let Some(questions) = &self.question {
             for q in questions {
@@ -192,12 +224,51 @@ impl DNSMessage {
         reply
     }
 
-    fn add_answer(&mut self, rr: ResourceRecord) {
+    pub(crate) fn add_answer(&mut self, rr: ResourceRecord) {
+        self.header.an_count += 1;
         match &mut self.answer {
             Some(answers) => answers.push(rr),
             None => self.answer = Some(vec![rr]),
         }
     }
+}
+
+fn parse_labels(bytes: &mut RawMessage) -> Result<String> {
+    let mut labels = vec![];
+    let mut current = bytes.current_pos;
+    let mut next_pointer = None;
+    let mut jumps = 0;
+    while let Ok(len_byte) = bytes.get(current) {
+        let len = len_byte as usize;
+        if len == 0 {
+            current += 1;
+            break;
+        }
+        if let Some(offset) = pointer(len_byte, bytes.get(current + 1)?) {
+            if jumps == 0 {
+                // Continues reading the question after finishing the labels
+                next_pointer = Some(current + 2);
+            }
+            jumps += 1;
+            if jumps > 5 {
+                return Err(anyhow!("too many pointers jumps, max: 5"));
+            }
+            current = offset as usize;
+            // Goes back to read the label from the offset
+            continue;
+        }
+        current += 1;
+
+        let label = bytes.get_range(current..current + len)?;
+        labels.push(std::str::from_utf8(label)?);
+        current += len;
+    }
+
+    let name = labels.join(".");
+    // Why is rust okay for the mut borrow after another unrelated instruction but not just after the loop?
+    // If the next_pointer is set, jumps to that value, otherwise continues with the current index
+    bytes.current_pos = next_pointer.unwrap_or(current);
+    Ok(name)
 }
 
 // returns the index to start reading the label from if it is a pointer
@@ -213,6 +284,10 @@ fn pointer(byte: u8, next: u8) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
+    use answer::Data;
+
     use super::*;
 
     #[test]
@@ -290,6 +365,38 @@ mod tests {
         assert_eq!(2, question.len());
         assert_eq!("abc.longassdomainname.com", question[0].name);
         assert_eq!("def.longassdomainname.com", question[1].name);
+        Ok(())
+    }
+
+    #[test]
+    fn test_from_bytes_with_answer() -> Result<()> {
+        let request: [u8; 512] = [
+            219, 180, 129, 0, 0, 1, 0, 1, 0, 0, 0, 0, 12, 99, 111, 100, 101, 99, 114, 97, 102, 116,
+            101, 114, 115, 2, 105, 111, 0, 0, 1, 0, 1, 12, 99, 111, 100, 101, 99, 114, 97, 102,
+            116, 101, 114, 115, 2, 105, 111, 0, 0, 1, 0, 1, 0, 0, 14, 16, 0, 4, 76, 76, 21, 21, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let message = DNSMessage::from_bytes(&request)?;
+        assert!(message.answer.is_some());
+        let answer = message.answer.unwrap();
+        assert_eq!(1, answer.len());
+        assert_eq!("codecrafters.io", answer[0].name);
+        assert_eq!(Data::IP(Ipv4Addr::new(76, 76, 21, 21)), answer[0].data);
         Ok(())
     }
 }

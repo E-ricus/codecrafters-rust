@@ -1,7 +1,8 @@
 # dns server implementation 
 
 ## WIP
-Currently is only parsing the header and question parts of the protocol
+Currently is able to fully parse a DNS message, correctly reply for Querys of IN A, and forward the messages to a resolver.
+Fully implements the codecrafter solution, but it can be extended.
 
 ## Codecrafters
 

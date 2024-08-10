@@ -1,79 +1,60 @@
 use anyhow::Result;
 
+use crate::impl_try_from;
+
 #[repr(u8)]
 #[derive(Debug, PartialEq, Copy, Clone)]
 enum MessageType {
+    Query,
+    Response,
+}
+
+impl_try_from!(MessageType, u8, {
     Query = 0,
     Response = 1,
-}
-
-impl TryFrom<u8> for MessageType {
-    type Error = anyhow::Error;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::Query),
-            1 => Ok(Self::Response),
-            _ => Err(anyhow::anyhow!("MessageType: invalid value: {value}")),
-        }
-    }
-}
+});
 
 #[repr(u8)]
 #[derive(Debug, PartialEq, Copy, Clone)]
 enum OpCode {
+    Query,
+    IQuery,
+    Status,
+    // The spec has reserved these values for future use, cc sends a 3 as a test.
+    Reserved,
+}
+
+impl_try_from!(OpCode, u8, {
     Query = 0,
     IQuery = 1,
     Status = 2,
-    // The spec has reserved these values for future use, cc sends a 3 as a test.
-    CodeCrafters = 3,
-}
+    Reserved = 3,
 
-// TODO: Maybe a small macro to implement this for all enums?
-impl TryFrom<u8> for OpCode {
-    type Error = anyhow::Error;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::Query),
-            1 => Ok(Self::IQuery),
-            2 => Ok(Self::Status),
-            3 => Ok(Self::CodeCrafters),
-            _ => Err(anyhow::anyhow!("OpCode: invalid value: {value}")),
-        }
-    }
-}
+});
 
 #[repr(u8)]
 #[derive(Debug, PartialEq, Copy, Clone)]
 enum ResponseCode {
+    NoError,
+    FormatError,
+    ServerFailure,
+    NameError,
+    NotImplemented,
+    Refused,
+}
+
+impl_try_from!(ResponseCode, u8, {
     NoError = 0,
     FormatError = 1,
     ServerFailure = 2,
     NameError = 3,
     NotImplemented = 4,
     Refused = 5,
-}
-
-impl TryFrom<u8> for ResponseCode {
-    type Error = anyhow::Error;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::NoError),
-            1 => Ok(Self::FormatError),
-            2 => Ok(Self::ServerFailure),
-            3 => Ok(Self::NameError),
-            4 => Ok(Self::NotImplemented),
-            5 => Ok(Self::Refused),
-            _ => Err(anyhow::anyhow!("ResponseCode: invalid value: {value}")),
-        }
-    }
-}
+});
 
 #[derive(Debug, PartialEq, Copy, Clone)]
-pub struct Header {
-    id: u16,                     // ID: 16 bits big endian
+pub(crate) struct Header {
+    pub(super) id: u16,          // ID: 16 bits big endian
     message_type: MessageType,   // QR: 1 bit
     op_code: OpCode,             // OPCODE: 4 bits
     auth_answer: bool,           // AA (The response server owns the domain): 1 bit
@@ -82,8 +63,8 @@ pub struct Header {
     recursion_available: bool,   // RA: 1 bit
     z: u8,                       // reserverd: 3 bits
     response_code: ResponseCode, // RCODE: 4 bits
-    pub(super) qd_count: u16,    // QDCOUNT: 16 bits big endian
-    an_count: u16,               // ANCOUNT: 16 bits big endian
+    pub(crate) qd_count: u16,    // QDCOUNT: 16 bits big endian
+    pub(crate) an_count: u16,    // ANCOUNT: 16 bits big endian
     ns_count: u16,               // NSCOUNT: 16 bits big endian
     ar_count: u16,               // ARCOUNT : 16 bits big endian
 }
@@ -109,11 +90,9 @@ impl Default for Header {
 }
 
 impl Header {
-    pub(super) fn build_reply(&self) -> Self {
-        let mut reply = self.clone();
+    pub(crate) fn build_reply(&self) -> Self {
+        let mut reply = *self;
         reply.message_type = MessageType::Response;
-        // Ideally answering the same amount of questions
-        reply.an_count = self.qd_count;
         reply.response_code = match self.op_code {
             OpCode::Query => ResponseCode::NoError,
             _ => ResponseCode::NotImplemented,
@@ -243,7 +222,7 @@ fn test_header_from_bytes_codecrafters_op_code() -> Result<()> {
 
     assert_eq!(1234, h.id);
     assert_eq!(MessageType::Response, h.message_type);
-    assert_eq!(OpCode::CodeCrafters, h.op_code);
+    assert_eq!(OpCode::Reserved, h.op_code);
     assert!(h.auth_answer);
     assert!(h.recursion_available);
     assert_eq!(520, h.an_count);
